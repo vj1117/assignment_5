@@ -1,0 +1,163 @@
+name: Model Requirements Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  test-model-requirements:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision nbformat
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    
+    - name: Extract model classes
+      run: |
+        # Install jupyter-nbconvert to help with notebook extraction
+        pip install jupyter nbconvert
+        
+        # Extract all model classes from the notebook
+        python -c "
+        import re
+        import nbformat
+        import json
+        
+        # Read the notebook
+        with open('ERA4_Assignment_5.ipynb', 'r', encoding='utf-8') as f:
+            nb = nbformat.read(f, as_version=4)
+        
+        # Extract all model classes and helper functions
+        model_code = []
+        count_params_code = None
+        model_classes = []
+        
+        # First pass: find all Small_MNIST classes and count_parameters function
+        for cell in nb['cells']:
+            if cell['cell_type'] == 'code':
+                source = cell['source']
+                
+                # Extract count_parameters function
+                if 'def count_parameters' in source and not count_params_code:
+                    count_params_code = source
+                
+                # Find model classes
+                if re.search(r'class\s+Small_MNIST\d+\s*\(', source):
+                    # Extract the class name
+                    match = re.search(r'class\s+(Small_MNIST\d+)\s*\(', source)
+                    if match:
+                        model_name = match.group(1)
+                        model_classes.append(model_name)
+                        # Modify the __init__ method to remove dropout_rate parameter
+                        modified_source = re.sub(
+                            r'def\s+__init__\s*\(\s*self\s*,\s*dropout_rate\s*=\s*[^)]+\)',
+                            'def __init__(self)',
+                            source
+                        )
+                        # Also replace any usage of dropout_rate with fixed values
+                        modified_source = re.sub(
+                            r'dropout_rate\s*\*\s*1\.5',
+                            '0.15',
+                            modified_source
+                        )
+                        modified_source = re.sub(
+                            r'nn\.Dropout2d\(dropout_rate\)',
+                            'nn.Dropout2d(0.1)',
+                            modified_source
+                        )
+                        model_code.append(modified_source)
+        
+        # Write the model classes to a file with all necessary imports
+        with open('models.py', 'w', encoding='utf-8') as f:
+            f.write('import torch\\n')
+            f.write('import torch.nn as nn\\n')
+            f.write('import torch.nn.functional as F\\n\\n')
+            
+            # Add the count_parameters function
+            if count_params_code:
+                f.write(count_params_code)
+                f.write('\\n\\n')
+            else:
+                # Fallback count_parameters function
+                f.write('def count_parameters(model):\\n')
+                f.write('    \"\"\"Count trainable parameters\"\"\"\\n')
+                f.write('    return sum(p.numel() for p in model.parameters() if p.requires_grad)\\n\\n')
+            
+            # Add the model classes
+            for code in model_code:
+                f.write(code)
+                f.write('\\n\\n')
+            
+            # Add test code
+            f.write('if __name__ == \"__main__\":\\n')
+            f.write('    print(\"Found model classes: {}\".format(' + json.dumps(model_classes) + '))\\n')
+            f.write('    for model_name in ' + json.dumps(model_classes) + ':\\n')
+            f.write('        try:\\n')
+            f.write('            model_class = globals()[model_name]\\n')
+            f.write('            model = model_class()\\n')
+            f.write('            params = count_parameters(model)\\n')
+            f.write('            print(f\"{model_name}: {params:,} parameters\")\\n')
+            f.write('            # Check for batch normalization\\n')
+            f.write('            has_bn = any(isinstance(m, nn.BatchNorm2d) for m in model.modules())\\n')
+            f.write('            # Check for dropout\\n')
+            f.write('            has_dropout = any(isinstance(m, (nn.Dropout, nn.Dropout2d)) for m in model.modules())\\n')
+            f.write('            # Check for GAP\\n')
+            f.write('            has_gap = any(isinstance(m, (nn.AdaptiveAvgPool2d, nn.AvgPool2d)) for m in model.modules())\\n')
+            f.write('            # Check for FC\\n')
+            f.write('            has_fc = any(isinstance(m, nn.Linear) for m in model.modules())\\n')
+            f.write('            print(f\"  Has BN: {has_bn}, Has Dropout: {has_dropout}, Has GAP: {has_gap}, Has FC: {has_fc}\")\\n')
+            f.write('        except Exception as e:\\n')
+            f.write('            print(f\"Error with {model_name}: {e}\")\\n')
+        "
+        
+        # Test the extracted models
+        echo "Testing extracted models:"
+        python models.py
+        
+        # Test the models
+        echo "Testing models:"
+        python models.py
+
+    - name: Run model checks
+      run: |
+        python model_checker.py models.py
+    
+    - name: Check results
+      run: |
+        echo "Model Requirements Check Results:"
+        cat model_requirements.json
+        
+        # Check if any model meets all requirements
+        python -c "
+        import json
+        with open('model_requirements.json', 'r') as f:
+            results = json.load(f)
+
+        success = False
+        for model_name, reqs in results.items():
+            if reqs['under_20k'] and reqs['has_bn'] and reqs['has_dropout'] and reqs['has_gap']:
+                print(f'✅ {model_name} meets all requirements!')
+                print(f'   Parameters: {reqs[\"total_params\"]}')
+                print(f'   Has Batch Normalization: {reqs[\"has_bn\"]}')
+                print(f'   Has Dropout: {reqs[\"has_dropout\"]}')
+                print(f'   Has Global Average Pooling: {reqs[\"has_gap\"]}')
+                print(f'   Has Fully Connected Layer: {reqs[\"has_fc\"]}')
+                success = True
+
+        if not success:
+            print('❌ No model meets all requirements!')
+            exit(1)
+        "
